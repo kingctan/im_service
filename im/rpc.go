@@ -525,6 +525,79 @@ func SendNotification(w http.ResponseWriter, req *http.Request) {
 	w.WriteHeader(200)
 }
 
+func SendSystemMessage2(w http.ResponseWriter, req *http.Request) {
+	body, err := ioutil.ReadAll(req.Body)
+	if err != nil {
+		WriteHttpError(400, err.Error(), w)
+		return
+	}
+	
+	obj, err := simplejson.NewJson(body)
+	if err != nil {
+		log.Info("error:", err)
+		WriteHttpError(400, "invalid json format", w)
+		return
+	}
+
+	appid, err := obj.Get("appid").Int64()
+	if err != nil {
+		log.Info("error:", err)
+		WriteHttpError(400, "invalid json format", w)
+		return		
+	}
+
+	content, err := obj.Get("content").String()
+	if err != nil {
+		log.Info("error:", err)
+		WriteHttpError(400, "invalid json format", w)
+		return
+	}
+
+	receivers, err := obj.Get("receivers").Array()
+	if err != nil {
+		log.Info("error:", err)
+		WriteHttpError(400, "invalid json format", w)
+		return		
+	}
+
+	receiver_ids := make([]int64, 0, len(receivers))	
+	for _, receiver := range receivers {
+		n, ok := receiver.(json.Number)
+		if !ok {
+			WriteHttpError(400, "invalid json format", w)
+			return
+		}
+		
+		receiver_id, err := n.Int64()
+		if err != nil {
+			log.Info("error:", err)
+			WriteHttpError(400, "invalid json format", w)
+			return
+		}
+		receiver_ids = append(receiver_ids, receiver_id)
+	}
+	
+	sys := &SystemMessage{content}
+	msg := &Message{cmd:MSG_SYSTEM, body:sys}
+
+	for _, uid := range receiver_ids {
+		msgid, err := SaveMessage(appid, uid, 0, msg)
+		if err != nil {
+			WriteHttpError(500, "internal server error", w)
+			return
+		}
+
+		//推送通知
+		PushMessage(appid, uid, msg)
+
+		//发送同步的通知消息
+		notify := &Message{cmd:MSG_SYNC_NOTIFY, body:&SyncKey{msgid}}
+		SendAppMessage(appid, uid, notify)
+	}
+	
+	w.WriteHeader(200)
+}
+
 
 func SendSystemMessage(w http.ResponseWriter, req *http.Request) {
 	body, err := ioutil.ReadAll(req.Body)
