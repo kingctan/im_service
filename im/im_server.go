@@ -25,9 +25,16 @@ import "runtime"
 import "math/rand"
 import "net/http"
 import "path"
+import "io/ioutil"
+import "strconv"
+import "strings"
+import "os"
+import "os/exec"
+import "sync/atomic"
 
 import "github.com/gomodule/redigo/redis"
-import log "github.com/golang/glog"
+import "gopkg.in/natefinch/lumberjack.v2"
+import log "github.com/sirupsen/logrus"
 import "github.com/valyala/gorpc"
 import "github.com/importcjj/sensitive"
 import "github.com/bitly/go-simplejson"
@@ -69,6 +76,9 @@ var relationship_pool *RelationshipPool
 var current_deliver_index uint64
 var group_message_delivers []*GroupMessageDeliver
 var filter *sensitive.Filter
+
+var low_memory int32//低内存状态
+
 
 func init() {
 	app_route = NewAppRoute()
@@ -200,6 +210,106 @@ func SyncKeyService() {
 	}
 }
 
+func formatStdOut(stdout []byte, userfulIndex int) []string {
+	eol := "\n"
+	infoArr := strings.Split(string(stdout), eol)[userfulIndex]
+	ret := strings.Fields(infoArr)
+	return ret
+}
+
+func ReadRSSDarwin(pid int) int64 {
+	args := "-o rss -p"
+	stdout, _ := exec.Command("ps", args, strconv.Itoa(pid)).Output()
+	ret := formatStdOut(stdout, 1)
+	if len(ret) == 0 {
+		log.Warning("can't find process")
+		return 0
+	}
+
+	rss, _ := strconv.ParseInt(ret[0], 10, 64)
+	return rss*1024
+}
+
+func ReadRSSLinux(pid int, pagesize int) int64 {
+	//http://man7.org/linux/man-pages/man5/proc.5.html
+	procStatFileBytes, err := ioutil.ReadFile(path.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		log.Warning("read file err:", err)
+		return 0
+	}
+	
+	splitAfter := strings.SplitAfter(string(procStatFileBytes), ")")
+
+	if len(splitAfter) == 0 || len(splitAfter) == 1 {
+		log.Warning("Can't find process ")
+		return 0
+	}
+	
+	infos := strings.Split(splitAfter[1], " ")
+	if len(infos) < 23 {
+		//impossible
+		return 0
+	}
+
+	rss, _ := strconv.ParseInt(infos[22], 10, 64)
+	return rss*int64(pagesize)
+}
+
+func ReadRSS(platform string, pid int, pagesize int) int64 {
+	if platform == "linux" {
+		return ReadRSSLinux(pid, pagesize)
+	} else if platform == "darwin" {
+		return ReadRSSDarwin(pid)
+	} else {
+		return 0
+	}
+}
+
+func MemStatService() {
+	platform := runtime.GOOS
+	pagesize := os.Getpagesize();
+	pid := os.Getpid()	
+	//3 min
+	ticker := time.NewTicker(time.Second * 60 * 3)
+	for range ticker.C {
+		rss := ReadRSS(platform, pid, pagesize)
+		if rss > config.memory_limit {
+			atomic.StoreInt32(&low_memory, 1)
+		} else {
+			atomic.StoreInt32(&low_memory, 0)
+		}
+		log.Infof("process rss:%dk low memory:%d", rss/1024, low_memory)
+	}
+}
+
+func initLog() {
+	if config.log_filename != "" {
+		writer := &lumberjack.Logger{
+			Filename:   config.log_filename,
+			MaxSize:    1024, // megabytes
+			MaxBackups: config.log_backup,
+			MaxAge:     config.log_age, //days
+			Compress:   false,
+		}
+		log.SetOutput(writer)
+		log.StandardLogger().SetNoLock()
+	}
+
+	log.SetReportCaller(config.log_caller)
+
+	level := config.log_level
+	if level == "debug" {
+		log.SetLevel(log.DebugLevel)
+	} else if level == "info" {
+		log.SetLevel(log.InfoLevel)
+	} else if level == "warn" {
+		log.SetLevel(log.WarnLevel)
+	} else if level == "fatal" {
+		log.SetLevel(log.FatalLevel)
+	}
+}
+
+
 func main() {
 	fmt.Printf("Version:     %s\nBuilt:       %s\nGo version:  %s\nGit branch:  %s\nGit commit:  %s\n", VERSION, BUILD_TIME, GO_VERSION, GIT_BRANCH, GIT_COMMIT_ID)
 	rand.Seed(time.Now().UnixNano())
@@ -211,6 +321,10 @@ func main() {
 	}
 	
 	config = read_cfg(flag.Args()[0])
+
+	initLog()
+
+	log.Info("startup...")
 	log.Infof("port:%d\n", config.port)
 
 	log.Infof("redis address:%s password:%s db:%d\n", 
@@ -227,6 +341,10 @@ func main() {
 	
 	log.Info("group deliver count:", config.group_deliver_count)
 	log.Infof("friend permission:%t enable blacklist:%t", config.friend_permission, config.enable_blacklist)
+	log.Infof("memory limit:%d", config.memory_limit)
+
+	log.Infof("log filename:%s level:%s backup:%d age:%d caller:%t",
+		config.log_filename, config.log_level, config.log_backup, config.log_age, config.log_caller)
 	
 	redis_pool = NewRedisPool(config.redis_address, config.redis_password, 
 		config.redis_db)
@@ -298,9 +416,11 @@ func main() {
 		filter = sensitive.New()
 		filter.LoadWordDict(config.word_file)
 	}
-	
-	group_manager = NewGroupManager()
-	group_manager.Start()
+
+	if len(config.mysqldb_datasource) > 0 {
+		group_manager = NewGroupManager()
+		group_manager.Start()
+	}
 
 	group_message_delivers = make([]*GroupMessageDeliver, config.group_deliver_count)
 	for i := 0; i < config.group_deliver_count; i++ {
@@ -313,6 +433,10 @@ func main() {
 	
 	go ListenRedis()
 	go SyncKeyService()
+
+	if config.memory_limit > 0 {
+		go MemStatService()
+	}
 
 	if config.friend_permission || config.enable_blacklist {
 		relationship_pool = NewRelationshipPool()
@@ -331,6 +455,6 @@ func main() {
 	if config.ssl_port > 0 && len(config.cert_file) > 0 && len(config.key_file) > 0 {
 		go ListenSSL(config.ssl_port, config.cert_file, config.key_file)
 	}
-	ListenClient()
+	ListenClient(config.port)
 	log.Infof("exit")
 }

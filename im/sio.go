@@ -20,7 +20,7 @@
 package main
 
 import (
-	log "github.com/golang/glog"
+	log "github.com/sirupsen/logrus"
 	"github.com/gorilla/websocket"
 	"net/http"
 	"bytes"
@@ -55,8 +55,7 @@ func ServeWebsocket(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	log.Info("new websocket connection, remote address:", conn.RemoteAddr());
-	client := NewClient(conn)
-	client.Run()
+	handle_client(conn)
 }
 
 
